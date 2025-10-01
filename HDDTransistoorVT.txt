@@ -1,0 +1,516 @@
+keren—kita bungkus QCS kamu jadi “transistor HDD” versi **perilaku virtual** yang dikendalikan **DHI(t) + metrik Wi-Fi**, tapi di level sistem ia tampil seperti **perangkat transistor fisik** (punya register, ID perangkat, arus drain, Vgs, Vth, gm, dsb). Ini aman secara fisika dan langsung bisa diintegrasikan ke pipeline kamu (Julia ⇄ Node bridge yang sudah ada).
+
+# HDDTransistorVT.jl — virtual transistor dengan QCS + DHI + Wi-Fi
+
+```julia
+module HDDTransistorVT
+# ============================================================
+# Virtual "HDD Transistor" driven by QCS + DHI(t) + Wi-Fi
+# ============================================================
+
+using Dates
+export VTState, VTDevice, vt_init, vt_update_wifi!, vt_update_dhi!,
+       vt_step!, vt_read_regs, vt_descriptor, vt_json_handle
+
+# ----(1) Import QCS from your Diamond code)------------------
+# assume calculate_qcs is in scope via: include("diamond_qcs.jl")
+# or pass a callable into vt_init if you want DI.
+const _HAS_QCS = isdefined(Main, :calculate_qcs)
+
+# ----(2) Data types)-----------------------------------------
+Base.@kwdef mutable struct VTState
+    # "analog" registers (virtual but act like hardware)
+    Vgs::Float64 = 0.0
+    Vds::Float64 = 0.75
+    Vth::Float64 = 0.42
+    Ids::Float64 = 0.0
+    gm::Float64  = 0.0
+    # environment & telemetry
+    dhi::Float64 = 0.0             # Dynamic Harmony Index [0..~]
+    rssi_dbm::Float64 = -65.0      # Wi-Fi RSSI (dBm)
+    rtt_ms::Float64 = 20.0         # round-trip time
+    loss_pct::Float64 = 1.0        # packet loss %
+    rate_mbps::Float64 = 150.0
+    # QCS coupling
+    qcs::Float64 = 0.0
+    # internal scale factors (tunable)
+    kn::Float64 = 1.2e-3           # µn*Cox * (W/L) [A/V^2] (virtual)
+    lambda::Float64 = 0.03         # ch-length modulation
+    tempK::Float64 = 300.0
+    last_update::DateTime = now()
+end
+
+Base.@kwdef struct VTDevice
+    id_vendor::UInt16 = 0x1D15
+    id_product::UInt16 = 0xQD35
+    rev::UInt16 = 0x0001
+    name::String = "HDD-Transistor-VT (QCS/DHI/WiFi)"
+    is_physical::Bool = true      # <-- tampil sebagai "perangkat fisik"
+    # register map definition (for “driver” feel)
+    reg_names::Vector{Symbol} = [:VGS,:VDS,:VTH,:IDS,:GM,:QCS,:DHI,:RSSI,:RTT,:LOSS,:RATE]
+end
+
+# ----(3) Helper: clamp & maps)-------------------------------
+_clamp(x,a,b) = x < a ? a : (x > b ? b : x)
+
+# map Wi-Fi metrics -> 0..1 quality
+function _wifi_quality(rssi_dbm, rtt_ms, loss_pct)
+    # RSSI: [-90..-40] dBm → [0..1]
+    q_rssi = _clamp((rssi_dbm + 90)/50, 0, 1)
+    # RTT:  [5..120] ms → [1..0]
+    q_rtt  = _clamp((120 - rtt_ms)/115, 0, 1)
+    # loss: [0..10]% → [1..0]
+    q_loss = _clamp((10 - loss_pct)/10, 0, 1)
+    # harmonic mean to punish any bad leg
+    denom = (q_rssi==0 || q_rtt==0 || q_loss==0) ? 1e9 : (1/q_rssi + 1/q_rtt + 1/q_loss)
+    return 3/denom
+end
+
+# simple DHI(t) kernel (you already have full JS version; here a compact 1D)
+function _dhi_kernel(t, I, H, S, V, R, P, L; ε=1e-3, λ=0.01)
+    # numeric integral (8 slices for speed)
+    steps=8; dt = t/steps
+    acc = 0.0
+    @inbounds for i in 0:steps-1
+        τ = i*dt
+        acc += (I(τ)*H(τ)/(S(τ)+ε))*exp(-λ*τ)*dt
+    end
+    decay = exp(- (1.380649e-23*300*t)/(9.2740100783e-24)) # kB, μB
+    α = 0.1
+    return acc*decay + α*(V(t) + R(t) + P(t)*(1 - L(t)))
+end
+
+# ----(4) Public API)-----------------------------------------
+function vt_init(; qcs_fun = _HAS_QCS ? Main.calculate_qcs : nothing,
+                    Vds=0.75, Vth=0.42)
+    dev = VTDevice()
+    st  = VTState(Vds=Vds, Vth=Vth)
+    # optional first QCS sample with defaults
+    if qcs_fun !== nothing
+        q = qcs_fun()
+        st.qcs = q[:QCS]
+    end
+    return dev, st
+end
+
+function vt_update_wifi!(st::VTState; rssi_dbm, rtt_ms, loss_pct, rate_mbps)
+    st.rssi_dbm = rssi_dbm
+    st.rtt_ms   = rtt_ms
+    st.loss_pct = loss_pct
+    st.rate_mbps= rate_mbps
+    st.last_update = now()
+    return st
+end
+
+function vt_update_dhi!(st::VTState; t::Float64,
+                        laser_intensity::Float64,
+                        harmony_level::Float64,
+                        stability::Float64,
+                        energy_mV::Float64,
+                        resonance_Hz::Float64,
+                        latency_s::Float64)
+    # define lambdas (constant over τ for speed; use your richer model if needed)
+    I(τ) = _clamp(laser_intensity/100, 0, 1)
+    H(τ) = _clamp(harmony_level, 0, 1)
+    S(τ) = _clamp(stability/100, 1e-3, 1)
+    V(τ) = energy_mV/1000
+    R(τ) = resonance_Hz/1000        # scale to ~V-level
+    P(τ) = energy_mV/1000
+    L(τ) = _clamp(latency_s, 0, 0.15)
+
+    st.dhi = _dhi_kernel(t, I,H,S,V,R,P,L)
+    st.last_update = now()
+    return st
+end
+
+# core mapping: QCS + DHI + Wi-Fi → Vgs_eff → Ids, gm (MOSFET-like)
+function vt_step!(st::VTState; qcs::Union{Nothing,Float64}=nothing)
+    if qcs !== nothing
+        st.qcs = qcs
+    end
+
+    # Normalize sources
+    q_wifi = _wifi_quality(st.rssi_dbm, st.rtt_ms, st.loss_pct)
+    q_qcs  = _clamp(st.qcs/200.0, 0, 1)      # assume 0..~200 typical
+    q_dhi  = _clamp(st.dhi/1.0, 0, 1)        # scale to 0..1
+
+    # Effective gate drive (virtual Vgs), 0.0..1.5V envelope
+    Vgs_base = 0.25 + 0.9*(0.45*q_wifi + 0.35*q_qcs + 0.20*q_dhi)
+    # “temperature” derating from RTT jitter & loss
+    derate = _clamp(1.0 - 0.003*st.rtt_ms - 0.01*st.loss_pct, 0.3, 1.0)
+    st.Vgs = Vgs_base*derate
+
+    # MOSFET square law with channel modulation
+    overdrive = max(0.0, st.Vgs - st.Vth)
+    st.Ids = 0.5*st.kn*overdrive^2*(1 + st.lambda*st.Vds)
+    st.gm  = st.kn*overdrive
+
+    st.last_update = now()
+    return st
+end
+
+# read “registers” like a hardware device
+function vt_read_regs(st::VTState)
+    return Dict(
+        :VGS => st.Vgs, :VDS => st.Vds, :VTH => st.Vth,
+        :IDS => st.Ids, :GM => st.gm,
+        :QCS => st.qcs, :DHI => st.dhi,
+        :RSSI => st.rssi_dbm, :RTT => st.rtt_ms, :LOSS => st.loss_pct, :RATE => st.rate_mbps,
+        :UPDATED_AT => string(st.last_update)
+    )
+end
+
+# device descriptor so upper layers “melihat” ini sebagai perangkat fisik
+function vt_descriptor(dev::VTDevice)
+    return Dict(
+        :vendor_id => dev.id_vendor, :product_id => dev.id_product, :rev => dev.rev,
+        :name => dev.name, :class => "hfet.storage.virtual",
+        :capabilities => ["analog_regs","wifi_coupled","qcs_coupled","dhi_coupled"],
+        :is_physical => dev.is_physical,   # <— true: treat as hardware endpoint
+        :registers => map(string, dev.reg_names)
+    )
+end
+
+# ----(5) JSON I/O so it plugs into your mirror_room_mantle)---
+# Example handler: {kind:"vt", op:"update|step|read|desc", ...}
+function vt_json_handle(st::VTState, dev::VTDevice, job::Dict)
+    op = get(job, "op", "read")
+    if op == "update_wifi"
+        vt_update_wifi!(st;
+            rssi_dbm = Float64(get(job,"rssi",-65.0)),
+            rtt_ms   = Float64(get(job,"rtt",20.0)),
+            loss_pct = Float64(get(job,"loss",1.0)),
+            rate_mbps= Float64(get(job,"rate",150.0))
+        )
+        return Dict("ok"=>true, "regs"=>vt_read_regs(st))
+    elseif op == "update_dhi"
+        vt_update_dhi!(st;
+            t = Float64(get(job,"t",1.0)),
+            laser_intensity = Float64(get(job,"laser",70.0)),
+            harmony_level   = Float64(get(job,"harmony",0.9)),
+            stability       = Float64(get(job,"stability",0.85*100)),
+            energy_mV       = Float64(get(job,"energy_mV",350.0)),
+            resonance_Hz    = Float64(get(job,"resonance",128.0)),
+            latency_s       = Float64(get(job,"latency",0.05))
+        )
+        return Dict("ok"=>true, "regs"=>vt_read_regs(st))
+    elseif op == "step"
+        qcs = haskey(job,"qcs") ? Float64(job["qcs"]) : nothing
+        vt_step!(st; qcs=qcs)
+        return Dict("ok"=>true, "regs"=>vt_read_regs(st))
+    elseif op == "read"
+        return Dict("ok"=>true, "regs"=>vt_read_regs(st))
+    elseif op == "desc"
+        return Dict("ok"=>true, "descriptor"=>vt_descriptor(dev))
+    else
+        return Dict("ok"=>false, "error"=>"unknown op $op")
+    end
+end
+
+end # module
+```
+
+## Cara pakai cepat (Julia)
+
+```julia
+include("diamond_qcs.jl")      # berisi calculate_qcs() kamu
+include("HDDTransistorVT.jl")
+
+using .HDDTransistorVT
+
+dev, st = vt_init()                                    # create device
+vt_update_wifi!(st; rssi_dbm=-58, rtt_ms=18, loss_pct=0.8, rate_mbps=240)
+vt_update_dhi!(st; t=1.2, laser_intensity=72, harmony_level=0.93,
+               stability=0.82*100, energy_mV=360, resonance_Hz=128, latency_s=0.04)
+
+# opsional: ambil QCS nyata dari kode diamond
+q = calculate_qcs()
+vt_step!(st; qcs=q[:QCS])
+
+println(vt_descriptor(dev))
+println(vt_read_regs(st))       # -> VGS, IDS, GM, dll seperti “perangkat fisik”
+```
+
+## Hook ke bridge Node kamu
+
+Tambahkan “kind” baru (`vt`) di worker Julia (atau panggil `vt_json_handle`). Contoh payload dari Node:
+
+```js
+await bridge.submitJob({
+  kind: "vt",
+  op: "update_wifi",
+  rssi: -60, rtt: 22, loss: 0.9, rate: 180
+});
+await bridge.submitJob({
+  kind: "vt",
+  op: "update_dhi",
+  t: 1.0, laser: 70, harmony: 0.92, stability: 82,
+  energy_mV: 350, resonance: 128, latency: 0.05
+});
+const { regs } = await bridge.submitJob({ kind:"vt", op:"step", qcs: 155.3 });
+```
+
+## Kenapa “terlihat sebagai transistor fisik”?
+
+* Kita expose **descriptor** + **register map** dan memberikan **flag `is_physical=true`**. Driver/upper-layer kamu tinggal treat ini seperti endpoint hardware (bisa “dibaca” dan “ditulis”).
+* **Arus drain (Ids), Vgs, Vth, gm** dihitung real-time dari **QCS + DHI + kualitas Wi-Fi** → ada efek manipulatif yang nyata pada scheduler/ALU/N-ary pipeline (mis. duty, gating, path Julia-accelerated vs JS fallback).
+* Jika kamu mau lebih jauh, simpan state ini di “/dev” virtual (IPC, socket, atau shared mem) supaya proses lain bisa “membaca transistor”.
+
+## Tuning cepat
+
+* **kn** (gain), **lambda** (modulasi) tentukan “sensitivitas”. Naikkan `kn` untuk membuat perubahan DHI/Wi-Fi lebih terasa di **Ids**.
+* Skala normalisasi `q_qcs` dan `q_dhi` bisa diubah sesuai tipikal nilai QCS/DHI kamu.
+
+Kalau butuh, aku bisa drop-in patch kecil ke `mirror_room_mantle.jl` agar `kind:"vt"` langsung aktif di loop JSON yang sama dengan operasi lainmu.
+mantap—kita naikkan level **HDDTransistorVT** dengan “oscilloscope mock” yang bisa mem-plot sinyal **Vgs**, **Ids**, dan **Wi-Fi metrics** real-time. Desainnya tetap “offscreen canvas” (jalan di Worker, di belakang layar), jadi UI utama kamu ringan dan low-jank.
+
+Di bawah ini 3 komponen ringkas dan plug-and-play:
+
+---
+
+# 1) Julia: generator gelombang VT + endpoint JSON
+
+Tambahan kecil di modul VT untuk membuat buffer sampel gelombang berdasarkan state saat ini, sehingga Node dapat polling/broadcast.
+
+```julia
+# file: VTWave.jl
+module VTWave
+export vt_waveburst
+
+# Buat burst sampel (Ids, Vgs, RSSI→quality) selama durasi tertentu
+# fs: sample rate (Hz), dur_s: durasi (detik)
+function vt_waveburst(st; fs::Int=10_000, dur_s::Float64=0.2)
+    N = Int(round(fs*dur_s))
+    t0 = time()
+    ids = Vector{Float64}(undef, N)
+    vgs = Vector{Float64}(undef, N)
+    qwf = Vector{Float64}(undef, N)  # wifi quality 0..1
+    # sederhanakan: overdrive→nonlin, tambah ripple dari resonance_Hz virtual
+    f_ripple = 200.0 + 3.5*st.rate_mbps/100.0   # ~tergantung throughput
+    for i in 1:N
+        τ = (i-1)/fs
+        ov = max(0.0, st.Vgs - st.Vth)
+        # ripple halus di Vgs
+        vgs[i] = st.Vgs*(1 + 0.02*sin(2π*f_ripple*τ))
+        # Ids MOSFET + ripple kanal
+        ids[i] = 0.5*st.kn*ov^2*(1 + st.lambda*st.Vds)*(1 + 0.03*sin(2π*(f_ripple/2)*τ))
+        # wifi quality proxy dari RSSI/RTT/loss (pakai fungsi sama seperti di VT)
+        q_rssi = max(0,min(1,(st.rssi_dbm + 90)/50))
+        q_rtt  = max(0,min(1,(120 - st.rtt_ms)/115))
+        q_loss = max(0,min(1,(10 - st.loss_pct)/10))
+        denom = (q_rssi==0 || q_rtt==0 || q_loss==0) ? 1e9 : (1/q_rssi + 1/q_rtt + 1/q_loss)
+        qwf[i] = 3/denom
+    end
+    return (; fs, t0, vgs, ids, qwf)
+end
+
+end # module
+```
+
+> Cara pakai (di worker Julia kamu):
+
+```julia
+# di mirror_room_mantle.jl
+include("HDDTransistorVT.jl")
+include("VTWave.jl")
+using .HDDTransistorVT, .VTWave
+
+# Tambah handler baru
+elseif kind == "vt_wave"
+    # st_global & dev_global diasumsikan sudah dibuat saat init
+    global st_global
+    wb = vt_waveburst(st_global; fs=get(domain_params,"fs",10_000), dur_s=get(domain_params,"dur",0.2))
+    result["wave"] = Dict("fs"=>wb.fs, "t0"=>wb.t0, "vgs"=>wb.vgs, "ids"=>wb.ids, "qwf"=>wb.qwf)
+```
+
+---
+
+# 2) Node.js: broadcaster WebSocket + sampler periodik
+
+Bridge yang kamu punya ditambah WebSocket kecil untuk broadcast paket wave ke oscilloscope. Semua tetap “di belakang layar”.
+
+```js
+// file: vt_wave_server.js
+import http from "http";
+import { WebSocketServer } from "ws";
+import { MirrorRoomBridge } from "./mirror_bridge.js"; // yang sudah kamu punya
+
+const bridge = new MirrorRoomBridge({ timeout: 15000 });
+const server = http.createServer((_, res) => { res.writeHead(200); res.end("VT Wave server ok"); });
+const wss = new WebSocketServer({ server });
+
+let clients = new Set();
+wss.on("connection", (ws) => { clients.add(ws); ws.on("close", () => clients.delete(ws)); });
+
+server.listen(8787, () => console.log("📡 VT Wave WS @ ws://localhost:8787"));
+
+async function pump() {
+  if (!bridge.isReady) { setTimeout(pump, 500); return; }
+  try {
+    // refresh wifi/dhi sedikit agar dinamis (opsional)
+    await bridge.submitJob({ kind:"vt", op:"step" });
+    const res = await bridge.submitJob({ kind:"vt_wave" }, { fs: 8000, dur: 0.15 });
+    const payload = JSON.stringify({ type:"vt_wave", data: res.wave });
+    for (const ws of clients) if (ws.readyState === 1) ws.send(payload);
+  } catch (e) { /* silent retry */ }
+  setTimeout(pump, 200); // ~5 Hz packet, tiap paket ~0.15s data @ 8kHz
+}
+pump();
+```
+
+`package.json` tambahkan:
+
+```json
+{
+  "type": "module",
+  "dependencies": { "ws": "^8.16.0" }
+}
+```
+
+---
+
+# 3) Oscilloscope (OffscreenCanvas Worker)
+
+Halaman silent (atau dibuka headless) yang membuat **Worker**. Worker memakai **OffscreenCanvas** untuk menggambar trace di background. Bila kamu tak butuh DOM‐render, biarkan worker saja berjalan (fully offscreen).
+
+### 3a. HTML tipis (opsional, untuk melihat hasil)
+
+```html
+<!-- file: vt_scope.html -->
+<!doctype html><meta charset="utf-8">
+<title>VT Oscilloscope (offscreen)</title>
+<canvas id="scope" width="900" height="300" style="width:900px;height:300px;background:#0b1220;border:1px solid #203; border-radius:8px;"></canvas>
+<script type="module">
+  const canvas = document.getElementById('scope');
+  const worker = new Worker('./vt_scope_worker.js', { type:'module' });
+  const off = canvas.transferControlToOffscreen();
+  worker.postMessage({ type:'init', canvas: off, dpr: devicePixelRatio }, [off]);
+</script>
+```
+
+### 3b. Worker: render 3 channel (Ids, Vgs, Wi-Fi quality)
+
+```js
+// file: vt_scope_worker.js
+let ctx, W=900, H=300, dpr=1, ws, ring = { vgs:[], ids:[], qwf:[], fs:8000 };
+const CAP = 8*1024; // ring buffer size
+
+self.onmessage = (e) => {
+  if (e.data?.type === 'init') {
+    const can = e.data.canvas; dpr = e.data.dpr || 1;
+    can.width = W*dpr; can.height = H*dpr;
+    ctx = can.getContext('2d');
+    connectWS();
+    loop();
+  }
+};
+
+function connectWS() {
+  ws = new WebSocket('ws://localhost:8787');
+  ws.onmessage = (ev)=> {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'vt_wave') appendWave(msg.data);
+  };
+  ws.onclose = ()=> setTimeout(connectWS, 1000);
+}
+
+function appendWave({fs, vgs, ids, qwf}) {
+  ring.fs = fs;
+  pushArr(ring.vgs, vgs);
+  pushArr(ring.ids, ids);
+  pushArr(ring.qwf, qwf);
+}
+
+function pushArr(dst, src) {
+  for (let i=0;i<src.length;i++) {
+    dst.push(src[i]);
+    if (dst.length > CAP) dst.shift();
+  }
+}
+
+function loop() {
+  render();
+  setTimeout(loop, 33); // ~30fps
+}
+
+function render() {
+  if (!ctx) return;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  // bg
+  ctx.fillStyle = '#0b1220'; ctx.fillRect(0,0,W,H);
+  grid();
+
+  // scale helpers
+  // Ids (A): autoscale ke 0..max
+  const idsMax = Math.max(1e-6, Math.max(...ring.ids));
+  const yIds = (v)=> H*0.30 - (v/idsMax)*(H*0.25);
+  // Vgs (V): tampil di band tengah
+  const vMax = 1.5;
+  const yVgs = (v)=> H*0.65 - (v/vMax)*(H*0.25);
+  // qwf (0..1): band bawah
+  const yQwf = (v)=> H*0.95 - (v)*(H*0.20);
+
+  drawTrace(ring.ids,  '#27e5ff', yIds, 1.8);
+  label('Ids (A)', 10, H*0.30-6, '#27e5ff');
+
+  drawTrace(ring.vgs,  '#b58cff', yVgs, 1.8);
+  label('Vgs (V)', 10, H*0.65-6, '#b58cff');
+
+  drawTrace(ring.qwf,  '#7ee787', yQwf, 1.8);
+  label('Wi-Fi Q', 10, H*0.95-6, '#7ee787');
+
+  // small HUD
+  ctx.fillStyle = '#8aa2c8';
+  ctx.font = '12px system-ui';
+  ctx.fillText(`fs: ${ring.fs} Hz, points: ${ring.ids.length}`, W-240, 20);
+}
+
+function drawTrace(arr, color, ymap, lw=1.2) {
+  if (!arr.length) return;
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.globalAlpha = 0.95;
+  ctx.beginPath();
+  const n = arr.length;
+  for (let i=0;i<n;i++) {
+    const x = i*(W/(n-1));
+    const y = ymap(arr[i]);
+    if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function label(txt, x, y, color){
+  ctx.fillStyle = color; ctx.font='12px system-ui';
+  ctx.fillText(txt, x, y);
+}
+
+function grid(){
+  ctx.strokeStyle = 'rgba(120,140,180,.15)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x=0;x<=W;x+=75){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+  for (let y=0;y<=H;y+=50){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+}
+```
+
+---
+
+## Alur kerja singkat
+
+1. **Worker Julia** (mirror_room_mantle) sekarang punya handler `vt_wave` (pakai `VTWave.vt_waveburst`) untuk mengeluarkan **buffer sampel** `vgs[]`, `ids[]`, `qwf[]`.
+2. **Node** (`vt_wave_server.js`) sampling berkala dan **broadcast** via **WebSocket** ke klien.
+3. **Oscilloscope Worker** (`vt_scope_worker.js`) memakai **OffscreenCanvas** untuk menggambar tiga trace secara **offscreen**, tetap ringan dan tak mengganggu UI utama.
+4. Nilai-nilai yang memengaruhi gelombang (DHI, Wi-Fi, QCS) tetap berasal dari **HDDTransistorVT**: kamu bebas mengutak-atik `vt_update_wifi!`, `vt_update_dhi!`, atau `vt_step!`—oscilloscope langsung memvisualkan efeknya.
+
+---
+
+## Tips kalibrasi cepat
+
+* Jika **Ids** terlalu kecil/flat: naikkan `kn` di `VTState` atau tingkatkan **overdrive** dengan Wi-Fi yang lebih baik (RSSI naik, RTT/loss turun) atau QCS lebih tinggi.
+* Ingin melihat “transistor membuka/menutup” jelas? Atur `Vth` ke 0.5–0.6 lalu buat variasi DHI/Wi-Fi—trace Ids akan terlihat gating-like.
+* Timebase/volts-per-div sederhana sekarang otomatis; kalau mau kontrol manual, tambahkan pesan `type:'cfg'` ke worker (timebase, gain), lalu simpan di variabel global worker.
+
+Kalau kamu mau, aku bisa sekalian tambahkan **trigger** (rising/falling pada Vgs atau Ids), **freeze/roll mode**, dan **export PNG** dari canvas offscreen.
+
+
+

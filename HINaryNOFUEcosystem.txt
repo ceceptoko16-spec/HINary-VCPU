@@ -1,0 +1,638 @@
+```julia
+############  HINary–Photonic NOFU Ecosystem — Single-File Julia Spec (v1.0)  ############
+module HINaryNOFUEcosystem
+using LinearAlgebra, Statistics, Random, FFTW
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# A) PHOTONIC NOFU (Neural Optical Fusion Unit) – Interference, Coherence, Activation   #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module PhotonicNOFU
+using ..LinearAlgebra, ..Statistics, ..FFTW
+
+export PhotonicState, PhotonicProcessor, photonic_fusion, create_photonic_processor
+
+struct PhotonicState
+    amplitude::ComplexF64      # amplitudo gelombang
+    phase::Float64             # fase (rad)
+    frequency::Float64         # Hz
+    coherence_sigma::Float64   # σ fase (rad) utk Cφ = exp(-Δφ²/(2σ²))
+    polarization::NTuple{3,Float64}
+end
+
+struct PhotonicProcessor
+    sigma_phi::Float64                       # σ fase default
+    activation::Function                     # aktivasi fotonik (relu/sigmoid/tanh)
+    band::UnitRange{Int}                     # pita frekuensi (indeks FFT) untuk MSC avg
+end
+
+# Aktivasi terinspirasi optik (bekerja pada intensitas 0..∞ kemudian dinormalisasi ke 0..1)
+photonic_relu(x::Float64)    = max(0.0, x - 0.1) * 1.2
+photonic_sigmoid(x::Float64) = 1.0 / (1.0 + exp(-8.0 * (x - 0.5)))
+photonic_tanh(x::Float64)    = (tanh(2.0 * x - 1.0) * 0.5 + 0.5)
+
+# Magnitude-Squared Coherence (Welch-like, ringkas)
+function msc_bandavg(x::AbstractVector{<:Real}, y::AbstractVector{<:Real}, band::UnitRange{Int})
+    n = min(length(x), length(y))
+    n < 8 && return 0.0
+    X = fft(x[1:n])
+    Y = fft(y[1:n])
+    Sxy = X .* conj.(Y)
+    Sxx = abs2.(X)
+    Syy = abs2.(Y)
+    b   = clamp.(collect(band), 1, n)
+    num = sum(abs2.(Sxy[b]))
+    den = sum(Sxx[b]) * sum(Syy[b]) + 1e-12
+    return clamp(num/den, 0.0, 1.0)
+end
+
+# Estimasi selisih fase dominan via bin maksimum pada band
+function phasediff_dominant(x::AbstractVector{<:Real}, y::AbstractVector{<:Real}, band::UnitRange{Int})
+    n = min(length(x), length(y))
+    X = fft(x[1:n]); Y = fft(y[1:n])
+    mags = abs.(X[band]) .+ abs.(Y[band])
+    idx  = findmax(mags)[2]
+    k    = first(band) + idx - 1
+    return angle(X[k]) - angle(Y[k])  # Δφ
+end
+
+"""
+    photonic_fusion(ble, wifi, proc)
+
+Keluaran:
+- fused_output :: Float64  ∈ [0,1]  = A(I) * Cφ
+- coherence_factor :: Float64 (Cφ)
+- phase_difference :: Float64 (Δφ)
+- interference_intensity :: Float64 (I = |E1+E2|² ter-normalisasi)
+- msc :: Float64 (band-avg MSC)
+"""
+function photonic_fusion(ble::Vector{Float64}, wifi::Vector{Float64}, proc::PhotonicProcessor)
+    # amplitudo sebagai mean (normalisasi ringan)
+    A1 = complex(mean(ble), 0.0); A2 = complex(mean(wifi), 0.0)
+    Δφ = phasediff_dominant(ble, wifi, proc.band)
+    Cφ = exp(-(Δφ^2) / (2*proc.sigma_phi^2))   # koherensi fase Gaussian
+
+    I  = abs2(A1) + abs2(A2) + 2*abs(A1)*abs(A2)*cos(Δφ)
+    I  = clamp(I, 0.0, 1.0)                     # normalisasi ringkas 0..1
+
+    A  = proc.activation
+    fused = clamp(A(I) * Cφ, 0.0, 1.0)
+    γ2 = msc_bandavg(ble, wifi, proc.band)
+
+    return (fused_output=fused, coherence_factor=Cφ, phase_difference=Δφ,
+            interference_intensity=I, msc=γ2)
+end
+
+function create_photonic_processor(;sigma_phi=0.7, activation::String="relu", band=5:32)
+    act = activation=="sigmoid" ? photonic_sigmoid :
+          activation=="tanh"    ? photonic_tanh    : photonic_relu
+    return PhotonicProcessor(sigma_phi, act, band)
+end
+
+end # module PhotonicNOFU
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# B) RADIO FUSION (BLE/WiFi) – Robust Preproc, EMA, Reliability, Traditional Fusion      #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module RadioFusion
+using ..Statistics
+
+export hampel_filter, exponential_moving_average, calculate_signal_reliability, adaptive_fusion
+
+function hampel_filter(signal::Vector{Float64}; window::Int=5, n_sigmas::Float64=3.0)
+    n = length(signal); out = copy(signal); w2 = window ÷ 2
+    for i in 1:n
+        a = max(1, i-w2); b = min(n, i+w2)
+        s = signal[a:b]; med = median(s); mad = median(abs.(s .- med)) + 1e-12
+        if abs(signal[i] - med) > n_sigmas * 1.4826 * mad
+            out[i] = med
+        end
+    end
+    out
+end
+
+exponential_moving_average(x::Vector{Float64}, α::Float64) = begin
+    n=length(x); y=similar(x); y[1]=x[1]
+    @inbounds for i in 2:n
+        y[i] = α*x[i] + (1-α)*y[i-1]
+    end
+    y
+end
+
+calculate_signal_reliability(x::Vector{Float64}) = begin
+    v = var(x)               # variasi tinggi → reliabilitas rendah
+    dif = diff(x); tv = std(dif)  # trend volatility
+    consistency = 1/(1+v)
+    stability   = exp(-tv)
+    clamp(consistency*stability, 0.0, 1.0)
+end
+
+"""
+    adaptive_fusion(ble, wifi; environment="indoor", tau=0.8)
+
+Keluaran: (Q_fused, w_ble, w_wifi, ρ, ble_rel, wifi_rel)
+"""
+function adaptive_fusion(ble::Vector{Float64}, wifi::Vector{Float64}; environment::String="indoor", tau::Float64=0.8)
+    b = hampel_filter(ble); w = hampel_filter(wifi)
+    α = 1 - exp(-1.0/max(tau,1e-6))
+    bema = exponential_moving_average(b, α); wema = exponential_moving_average(w, α)
+    rB = calculate_signal_reliability(b); rW = calculate_signal_reliability(w)
+    denom = rB + rW + 1e-12; wB = rB/denom; wW = rW/denom
+    ρ = isnan(cor(b,w)) ? 0.0 : cor(b,w); κ=0.5; γ=max(0.0,1-κ*ρ^2)
+
+    Q_lin = wB*bema[end] + wW*wema[end]
+    Q_or  = 1 - (1-bema[end])^(γ*wB) * (1-wema[end])^(γ*wW)
+    β = 0.6
+    Q = clamp(β*Q_or + (1-β)*Q_lin, 0.0, 1.0)
+    return (Q, wB, wW, ρ, rB, rW)
+end
+
+end # module RadioFusion
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# C) NEURAL OPTICAL FUSION (Complex-valued forward only, coherence-aware)               #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module NeuralOpticalFusion
+using ..LinearAlgebra, ..Statistics
+
+export NOFULayer, NOFUNetwork, create_nofu_network, forward_pass
+
+struct NOFULayer
+    W::Matrix{ComplexF64}    # optical coupling weights
+    b::Vector{Float64}       # phase biases (rad)
+    activation::Function     # applies on magnitude/intensity
+    coh_thr::Float64         # min coherence threshold
+end
+
+struct NOFUNetwork
+    layers::Vector{NOFULayer}
+end
+
+# Magnitude-only activation, phase preserved across layers
+_mag_act(z::AbstractVector{ComplexF64}, act::Function) = begin
+    m = abs.(z); a = act.(clamp.(m,0,1)); a .* exp.(im .* angle.(z))
+end
+
+_calc_input_coherence(x::Vector{ComplexF64}) = begin
+    n=length(x); n<2 && return 1.0
+    # korelasi melingkar sederhana
+    vals = [abs(dot(x, circshift(x,k))) for k in 1:min(10,n-1)]
+    mean(vals)/(norm(x)^2 + 1e-12)
+end
+
+function forward_pass(layer::NOFULayer, x::Vector{ComplexF64})
+    y  = layer.W * x
+    yb = y .* exp.(im .* layer.b)
+    y2 = _mag_act(yb, layer.activation)
+    κ  = _calc_input_coherence(x)
+    if κ < layer.coh_thr
+        y2 .*= κ/layer.coh_thr
+    end
+    return y2, κ
+end
+
+function forward_pass(net::NOFUNetwork, ble::Vector{Float64}, wifi::Vector{Float64})
+    # embed fase berbeda utk diversitas
+    xb = ble .* exp.(im .* (0:length(ble)-1) .* (π/8))
+    xw = wifi .* exp.(im .* (0:length(wifi)-1) .* (π/6))
+    x  = vcat(xb, xw) |> ComplexF64.
+    κlast = 1.0
+    for L in net.layers
+        x, κ = forward_pass(L, x)
+        κlast = κ
+    end
+    fused = clamp(mean(abs.(x)), 0.0, 1.0)
+    return (fused_output=fused, layer_output=x, coherence_level=κlast)
+end
+
+function create_nofu_network(input_len::Int=20; hidden::Vector{Int}=[16,8,4], activation=PhotonicNOFU.photonic_relu, coh_thr=0.6)
+    layers = Vector{NOFULayer}()
+    prev = input_len*2
+    for h in hidden
+        push!(layers, NOFULayer(0.1*randn(ComplexF64,h,prev), 0.1*randn(h), activation, coh_thr))
+        prev = h
+    end
+    # output layer (1 neuron linear magnitude)
+    push!(layers, NOFULayer(0.1*randn(ComplexF64,1,prev), 0.1*randn(1), x->x, 0.5))
+    NOFUNetwork(layers)
+end
+
+end # module NeuralOpticalFusion
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# D) HYBRID PHOTONIC FUSION – Combine Traditional, Photonic, Neural with adaptive w     #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module HybridPhotonicFusion
+using ..PhotonicNOFU, ..NeuralOpticalFusion, ..RadioFusion, ..Statistics
+
+export HybridFusionEngine, create_hybrid_fusion_engine, process_hybrid_fusion, adapt_fusion_strategy
+
+struct HybridFusionEngine
+    photonic_proc::PhotonicNOFU.PhotonicProcessor
+    nofu::NeuralOpticalFusion.NOFUNetwork
+    weights::NTuple{3,Float64}                 # (trad, phot, neural)
+    mode::Symbol                               # :hybrid | :traditional | :photonic | :neural
+end
+
+function _adaptive_weights(ble::Vector{Float64}, wifi::Vector{Float64}, env::Symbol, mob::Symbol)
+    w = [0.4,0.3,0.3] # trad, phot, neural (default)
+    μb, μw = mean(ble), mean(wifi)
+    σb, σw = std(ble),  std(wifi)
+    Δq = abs(μb-μw)
+    stb = 1-σb; stw = 1-σw
+
+    if Δq > 0.3
+        w = [0.2,0.3,0.5]           # kualitas timpang → neural
+    elseif stb < 0.7 && stw < 0.7
+        w = [0.2,0.5,0.3]           # keduanya tidak stabil → photonic
+    elseif env == :outdoor
+        w = [0.5,0.4,0.1]
+    elseif mob == :high
+        w = [0.2,0.4,0.4]
+    end
+    w ./= sum(w)
+    return (w[1],w[2],w[3])
+end
+
+function process_hybrid_fusion(engine::HybridFusionEngine, ble::Vector{Float64}, wifi::Vector{Float64};
+                               environment::Symbol=:indoor, mobility::Symbol=:static, tau::Float64=0.8)
+    # Traditional
+    Q_trad, _, _, _, _, _ = RadioFusion.adaptive_fusion(ble, wifi; environment=String(environment), tau=tau)
+
+    # Photonic
+    phot = PhotonicNOFU.photonic_fusion(ble, wifi, engine.photonic_proc)
+
+    # Neural
+    neur = NeuralOpticalFusion.forward_pass(engine.nofu, ble, wifi)
+
+    # Adaptive weights
+    wt, wp, wn = _adaptive_weights(ble, wifi, environment, mobility)
+    Q_hyb = wt*Q_trad + wp*phot.fused_output + wn*neur.fused_output
+    Q_hyb = clamp(Q_hyb, 0.0, 1.0)
+
+    return (hybrid_output=Q_hyb, traditional=Q_trad, photonic=phot.fused_output,
+            neural=neur.fused_output, weights=(wt,wp,wn),
+            coherence=max(phot.coherence_factor, neur.coherence_level),
+            msc=phot.msc, Δφ=phot.phase_difference)
+end
+
+function adapt_fusion_strategy(engine::HybridFusionEngine, perf_hist::Vector{Float64}, env::Symbol)
+    length(perf_hist) < 5 && return engine
+    recent = perf_hist[end-4:end]; trend = recent[end] - recent[1]; avg = mean(recent)
+    mode = engine.mode
+    if trend < -0.1 && avg < 0.7
+        mode = :traditional
+    elseif trend > 0.05 && avg > 0.8
+        mode = :hybrid
+    end
+    if env == :dynamic
+        mode = :neural
+    end
+    HybridFusionEngine(engine.photonic_proc, engine.nofu, engine.weights, mode)
+end
+
+function create_hybrid_fusion_engine(;input_len::Int=20)
+    proc = PhotonicNOFU.create_photonic_processor(;sigma_phi=0.7, activation="relu", band=5:32)
+    net  = NeuralOpticalFusion.create_nofu_network(input_len)
+    HybridFusionEngine(proc, net, (0.4,0.3,0.3), :hybrid)
+end
+
+end # module HybridPhotonicFusion
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# E) QUANTUM–PHOTONIC BRIDGE – Simple Hamiltonian evolution + interference coupling      #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module QuantumPhotonic
+using ..LinearAlgebra, ..PhotonicNOFU
+
+export QuantumPhotonicState, create_qp_state, quantum_photonic_fuse
+
+struct QuantumPhotonicState
+    quantum_amp::ComplexF64              # amplitudo state kuantum (skalar ringkas)
+    entanglement::Matrix{ComplexF64}     # 2x2
+    superpos::Vector{ComplexF64}         # vektor 2
+end
+
+_create_H(signal::Vector{Float64}) = ComplexF64.([mean(signal) std(signal); std(signal) mean(signal)])
+
+function _evolve(q::QuantumPhotonicState, H::Matrix{ComplexF64}, dt::Float64)
+    U  = exp(-im * H * dt)
+    qa = U[1,1]*q.quantum_amp          # evolusi ringkas utk skalar (ambil komponen)
+    E  = U * q.entanglement * U'
+    s  = U * q.superpos
+    QuantumPhotonicState(qa, E, s)
+end
+
+function quantum_photonic_fuse(ble::Vector{Float64}, wifi::Vector{Float64},
+                               photonic::NamedTuple, q::QuantumPhotonicState; dt=0.1)
+    Ht = _create_H(ble) + _create_H(wifi)
+    q2 = _evolve(q, Ht, dt)
+    # amplitude fotonik dari intensitas & fase
+    a_ph = sqrt(max(photonic.interference_intensity,0)) * cis(photonic.phase_difference)
+    tot  = (a_ph + q2.quantum_amp)/sqrt(2)
+    enh  = tot * (1 + 0.2*norm(q2.entanglement))
+    prob = abs2(enh)                      # probabilitas terukur
+    return (fused_output=clamp(prob,0,1), quantum_prob=abs2(q2.quantum_amp),
+            entanglement_strength=norm(q2.entanglement))
+end
+
+create_qp_state() = QuantumPhotonicState(1+0im, ComplexF64.([1 0; 0 1]), ComplexF64.([1,0]))
+
+end # module QuantumPhotonic
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# F) SOFTWARE-DEFINED MOSFET (SD-MOSFET) & HINary Governor                               #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module QuantumTransistor
+export mosfet_current, quantum_gate_control
+
+# MOSFET kuasi-fisik (kn default kecil; lambda channel length modulation)
+function mosfet_current(Vgs::Float64, Vth::Float64; kn::Float64=1e-3, lambda::Float64=0.02, Vds::Float64=0.1)
+    if Vgs <= Vth
+        return max(0.0, 1e-12 * randn())  # noise kuantum kecil
+    elseif Vds < (Vgs - Vth)              # linear
+        Ids = kn * ((Vgs - Vth) * Vds - 0.5 * Vds^2) * (1 + lambda*Vds)
+    else                                   # saturasi
+        Ids = 0.5 * kn * (Vgs - Vth)^2 * (1 + lambda*Vds)
+    end
+    tun = 1e-9 * exp((Vgs - Vth) * 5.0)
+    return max(0.0, Ids + tun * randn())
+end
+
+function quantum_gate_control(Vgs::Float64, Vth::Float64, qnorm::Float64)
+    Vgs_eff = Vgs * (1 + 0.1*qnorm)
+    p_tun   = exp(-(Vth - Vgs_eff)) # ~prob tunneling
+    Vgs_eff * (1 + 0.05*p_tun*randn())
+end
+
+end # module QuantumTransistor
+
+module HINary
+export hinary_continuous, pollen_gate
+
+# Ternary kontinu (−1..1) dgn 2 zona transisi halus
+function hinary_continuous(x::Float64; th=(5.0,3.0,1.0,-2.0), smoothness::Float64=2.0)
+    th1,th2,th3,th4 = th
+    if x >= th1
+        return 1.0
+    elseif x >= th2
+        t = (x-th2)/(th1-th2); return 1 - t^smoothness
+    elseif x >= th3
+        return 0.0
+    elseif x >= th4
+        t = (x-th4)/(th3-th4); return -1 + (1-t)^smoothness
+    else
+        return -1.0
+    end
+end
+
+pollen_gate(x::Float64; th1=5.0, th2=3.0, th3=1.0, th4=-2.0) = x>th1 ? 1.0 : x>=th3 ? 0.0 : -1.0
+
+end # module HINary
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# G) VIRTUAL MOTOR (untuk memberi dinamika energi/aktuasi sederhana)                     #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module VirtualMotor
+using ..LinearAlgebra
+export MotorState, motor_dynamics, efficiency
+
+struct MotorState
+    ω::Float64        # rad/s
+    i::Float64        # A
+    τ::Float64        # N·m
+    T::Float64        # °C
+end
+
+function motor_dynamics(s::MotorState, V::Float64, τ_load::Float64, p::Dict{Symbol,Float64}, dt::Float64)
+    R=p[:R]; L=p[:L]; Kt=p[:Kt]; Ke=p[:Ke]; J=p[:J]; B=p[:B]
+    e = Ke*s.ω
+    di = (V - s.i*R - e)/L
+    i2 = s.i + di*dt
+    τm = Kt*i2
+    dω = (τm - B*s.ω - τ_load)/J
+    ω2 = s.ω + dω*dt
+    Pl = i2^2 * R
+    dT = (Pl - (s.T-25.0)*0.1)/100.0
+    T2 = s.T + dT*dt
+    MotorState(ω2, i2, τm, T2)
+end
+
+efficiency(s::MotorState, V::Float64) = begin
+    Pel = max(V*s.i, 1e-9); Pm = max(s.τ*s.ω, 0.0); clamp(Pm/Pel, 0.0, 1.0)
+end
+
+end # module VirtualMotor
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# H) Q-SPHERE MIMO (unitary precoder dari peta fase)                                     #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module QSphereMIMO
+using ..LinearAlgebra, ..Random
+
+export make_unitary
+
+"""
+    make_unitary(phases::Vector{Float64}, m::Int)
+
+Bangun precoder unitary U (m×m) stabil via QR, seeded oleh ringkasan fase.
+"""
+function make_unitary(phases::Vector{Float64}, m::Int=4)
+    seed = round(Int, 1e6*sum(abs.(phases)))
+    Random.seed!(seed)
+    A = randn(ComplexF64, m, m) .+ im*randn(ComplexF64, m, m)
+    Q, R = qr(A)
+    U = Matrix(Q)
+    # normalisasi fase global kecil agar deterministik-ish
+    θ = 2π*mean(phases)/(1+length(phases))
+    U .* cis(θ)
+end
+
+end # module QSphereMIMO
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# I) SYSTEM INTEGRATION – satukan Fusion → SD-MOSFET/HINary → Motor → Metrics            #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module SystemIntegration
+using ..RadioFusion, ..PhotonicNOFU, ..NeuralOpticalFusion, ..HybridPhotonicFusion
+using ..QuantumTransistor, ..HINary, ..VirtualMotor, ..QSphereMIMO, ..QuantumPhotonic
+using ..LinearAlgebra, ..Statistics
+
+export UnifiedSystem, update_system, auto_optimize, safety_preset, perf_metrics
+
+struct UnifiedSystem
+    # Transistor
+    Vgs::Float64; Vth::Float64; Ids::Float64
+    # Fusion
+    ble_q::Float64; wifi_q::Float64; Qfused::Float64; coherence::Float64
+    # HINary
+    hstate::Float64
+    # Motor
+    rpm::Float64; torque::Float64; η::Float64
+    # Performance
+    score::Float64; energy_gain::Float64; temp::Float64
+    # Unitary (Q-Sphere)
+    U::Matrix{ComplexF64}
+end
+
+perf_metrics(Qf::Float64, Ids::Float64, s::VirtualMotor.MotorState) = begin
+    fus = 40.0*Qf
+    trn = min(Ids*1000/10, 30.0)
+    mot = clamp(s.ω/(5000*2π/60), 0, 1)*30.0
+    overall = fus + trn + mot
+    egain = 1.5 + Qf
+    (overall, egain)
+end
+
+function safety_preset(cpu95::Float64, io95::Float64, free_frac::Float64)
+    # returns (:SAFE|:BAL|:AGGR, chunkMB, prefetch, baseN)
+    if cpu95>80 || io95>120 || free_frac<0.2
+        return (:SAFE, 8, 1, 2)
+    elseif cpu95>70 || io95>100 || free_frac<0.3
+        return (:BAL, 16, 2, 3)
+    else
+        return (:AGGR, 24, 3, 8)
+    end
+end
+
+function update_system(sys::UnifiedSystem,
+                       ble::Vector{Float64}, wifi::Vector{Float64};
+                       env::Symbol=:indoor, mob::Symbol=:static, tau::Float64=0.8, dt::Float64=0.1)
+
+    # 1) Hybrid fusion (trad+phot+neural)
+    engine = HybridPhotonicFusion.create_hybrid_fusion_engine(;input_len=length(ble))
+    fres   = HybridPhotonicFusion.process_hybrid_fusion(engine, ble, wifi; environment=env, mobility=mob, tau=tau)
+    Qf = fres.hybrid_output
+    coh = fres.coherence
+
+    # 2) SD-MOSFET gate drive dari Qf
+    Vgs_eff = QuantumTransistor.quantum_gate_control(sys.Vgs*(0.5+0.5Qf), sys.Vth, coh)
+    Ids     = QuantumTransistor.mosfet_current(Vgs_eff, sys.Vth)
+
+    # 3) HINary state (miliamp scale)
+    hst = HINary.hinary_continuous(Ids*1000.0)
+
+    # 4) Q-Sphere MIMO precoder (update ringan)
+    U = QSphereMIMO.make_unitary([fres.Δφ, fres.msc, coh], 4)
+
+    # 5) Motor dynamics (drive ∝ Qf)
+    Vd = 12.0*(0.2 + 0.8Qf)
+    params = Dict(:R=>1.2,:L=>0.01,:Kt=>0.015,:Ke=>0.015,:J=>1.8e-4,:B=>1.2e-4)
+    s0 = VirtualMotor.MotorState(sys.rpm*2π/60, 0.0, 0.0, sys.temp)
+    τload = 0.05*(1-coh)
+    s1 = VirtualMotor.motor_dynamics(s0, Vd, τload, params, dt)
+    η  = VirtualMotor.efficiency(s1, Vd)
+
+    # 6) Metrics
+    sc, eg = perf_metrics(Qf, Ids, s1)
+
+    UnifiedSystem(Vgs_eff, sys.Vth, Ids,
+                  mean(ble), mean(wifi), Qf, coh,
+                  hst,
+                  s1.ω*60/(2π), s1.τ, η,
+                  sc, eg, s1.T,
+                  U)
+end
+
+function auto_optimize(sys::UnifiedSystem, hist::Vector{UnifiedSystem})
+    length(hist)<5 && return sys
+    perf = [x.score for x in hist[end-4:end]]
+    avg = mean(perf); tr = perf[end]-perf[1]
+    Vgs = sys.Vgs; Vth = sys.Vth
+    if avg>80 && tr>0
+        Vgs = min(1.2, Vgs*1.1)
+    elseif avg<60 || tr<-5
+        Vgs = max(0.1, Vgs*0.9); Vth = min(0.6, Vth*1.05)
+    end
+    if sys.temp>60
+        Vgs *= 0.8
+    end
+    UnifiedSystem(Vgs, Vth, sys.Ids,
+                  sys.ble_q, sys.wifi_q, sys.Qfused, sys.coherence,
+                  sys.hstate,
+                  sys.rpm, sys.torque, sys.η,
+                  sys.score, sys.energy_gain, sys.temp,
+                  sys.U)
+end
+
+end # module SystemIntegration
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# J) AUTOPILOT – Loop integrasi + history + safety                                       #
+#────────────────────────────────────────────────────────────────────────────────────────#
+module Autopilot
+using ..SystemIntegration
+
+export AutopilotState, initialize, step
+
+struct AutopilotState
+    sys::SystemIntegration.UnifiedSystem
+    hist::Vector{SystemIntegration.UnifiedSystem}
+    perf_hist::Vector{Float64}
+    cycle::Int
+end
+
+function initialize()
+    U0 = Matrix{ComplexF64}(I, 4, 4)
+    s0 = SystemIntegration.UnifiedSystem(
+        0.7, 0.4, 0.0,       # Vgs,Vth,Ids
+        0.75,0.68,0.71,0.82, # BLE,WIFI,Qf,coh
+        0.0,                 # HINary
+        0.0,0.0,0.0,         # rpm,τ,η
+        50.0,1.8,35.0,       # score,energy_gain,temp
+        U0
+    )
+    AutopilotState(s0, [s0], [50.0], 0)
+end
+
+function step(st::AutopilotState, ble::Vector{Float64}, wifi::Vector{Float64};
+              env::Symbol=:indoor, mob::Symbol=:static, tau::Float64=0.8, dt::Float64=0.1,
+              cpu95::Float64=55.0, io95::Float64=80.0, free_frac::Float64=0.5)
+
+    # Safety preset (chunk/prefetch/baseN hanya sebagai KPI, tidak mengikat di sini)
+    mode, chunkMB, prefetch, baseN = SystemIntegration.safety_preset(cpu95, io95, free_frac)
+
+    # Update system
+    s1 = SystemIntegration.update_system(st.sys, ble, wifi; env=env, mob=mob, tau=tau, dt=dt)
+
+    # Auto-optimize tiap 10 siklus
+    s2 = st.cycle % 10 == 0 ? SystemIntegration.auto_optimize(s1, st.hist) : s1
+
+    hist = vcat(st.hist, [s2]); length(hist)>100 && (hist = hist[end-99:end])
+    pf   = vcat(st.perf_hist, [s2.score]); length(pf)>50 && (pf = pf[end-49:end])
+
+    return AutopilotState(s2, hist, pf, st.cycle+1), (mode=mode, chunkMB=chunkMB, prefetch=prefetch, baseN=baseN)
+end
+
+end # module Autopilot
+
+#────────────────────────────────────────────────────────────────────────────────────────#
+# K) DEMO / ENTRYPOINT – Simulasi terpadu (ringkas)                                      #
+#────────────────────────────────────────────────────────────────────────────────────────#
+export run_demo
+
+function run_demo(;cycles=30, len=64, env::Symbol=:indoor, mob::Symbol=:static)
+    println("🚀 HINary–Photonic NOFU Ecosystem: demo start ($cycles cycles)")
+    st = Autopilot.initialize()
+    rng = MersenneTwister(42)
+
+    for c in 1:cycles
+        ble  = 0.5 .+ 0.3 .* randn(rng, len)
+        wifi = 0.4 .+ 0.4 .* randn(rng, len)
+        # simulasi beban
+        cpu95 = 55 + 10*sin(0.2c); io95 = 80 + 20*sin(0.15c+0.7); free = 0.45 - 0.05*sin(0.1c)
+
+        st, preset = Autopilot.step(st, ble, wifi; env=env, mob=mob, cpu95=cpu95, io95=io95, free_frac=free)
+
+        if c % 10 == 0
+            s = st.sys
+            @info "Cycle $c" Qfused=round(s.Qfused,digits=3) score=round(s.score,digits=1) temp=round(s.temp,digits=1) \
+                  mode=preset.mode chunkMB=preset.chunkMB prefetch=preset.prefetch baseN=preset.baseN \
+                  coh=round(s.coherence,digits=3)
+        end
+    end
+    println("✅ demo done.")
+    return st
+end
+
+end # module HINaryNOFUEcosystem
+```
